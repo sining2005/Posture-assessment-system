@@ -29,3 +29,6 @@ def test_main_window_contains_user_page(qtbot, db, user_service, settings):
     window.show()
     assert window.pages.currentWidget() is window.user_page
     assert window.nav_buttons["用户信息"].isChecked()
+    window.show_module("骨盆检测")
+    assert window.pages.currentWidget() is window.pelvis_page
+    assert window.nav_buttons["骨盆检测"].isChecked()

@@ -1,18 +1,24 @@
 from __future__ import annotations
 
 import importlib
+import hashlib
 import json
 import multiprocessing as mp
 import os
 import queue
 import time
 from abc import ABC, abstractmethod
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 
+from posture_assessment.posture.orientation import (
+    matrix_to_quaternion,
+    reflect_camera_y_to_up,
+    rotation_about,
+)
 from posture_assessment.posture.types import (
     JOINT_INDEX,
     FrameBundle,
@@ -136,6 +142,27 @@ def _synthetic_images(pose: PoseKind) -> tuple[np.ndarray, np.ndarray, np.ndarra
     return color, depth, mask
 
 
+def _mock_joint_orientations(pose: PoseKind, index: int) -> np.ndarray:
+    view_yaw = {
+        PoseKind.FRONT: 0.0,
+        PoseKind.LEFT: 90.0,
+        PoseKind.BACK: 180.0,
+        PoseKind.RIGHT: -90.0,
+        PoseKind.ADAMS: 0.0,
+    }[pose]
+    pitch = 6.0 + 0.08 * np.sin(index / 2)
+    yaw = 2.2 + 0.08 * np.cos(index / 3)
+    obliquity = 0.8 + 0.05 * np.sin(index / 4)
+    rotation = (
+        rotation_about("y", view_yaw)
+        @ rotation_about("y", yaw)
+        @ rotation_about("x", pitch)
+        @ rotation_about("z", obliquity)
+    )
+    quaternion = matrix_to_quaternion(rotation)
+    return np.repeat(quaternion[np.newaxis, :], 32, axis=0)
+
+
 class MockCameraAdapter(DepthCameraAdapter):
     def __init__(
         self, scenario: str = "normal", seed: int = 7, fallback_message: str = ""
@@ -170,6 +197,7 @@ class MockCameraAdapter(DepthCameraAdapter):
         jitter = self.random.normal(0, 1.1, size=joints.shape)
         joints = joints + jitter
         confidence = np.full(32, JointConfidence.HIGH, dtype=np.uint8)
+        orientations = _mock_joint_orientations(pose, index)
         metadata: dict[str, Any] = {
             "body_count": 1,
             "orientation_deg": float(self.random.normal(0, 0.4)),
@@ -208,6 +236,7 @@ class MockCameraAdapter(DepthCameraAdapter):
                 "calibration_version": "MOCK-GROUND-1",
             },
             timestamp_usec=int(time.time_ns() // 1000) + index * 66_667,
+            joint_orientations_wxyz=orientations,
             metadata=metadata,
         )
 
@@ -267,6 +296,7 @@ class ReplayCameraAdapter(DepthCameraAdapter):
             if calibration_path.exists()
             else {"coordinate_system": "ground_mm_right_up_forward", "device_serial": "REPLAY"}
         )
+        self._verify_recorded_files(pose_root, (path, calibration_path))
         with np.load(path, allow_pickle=False) as data:
             colors = data["color"]
             depths = data["depth_mm"]
@@ -274,6 +304,11 @@ class ReplayCameraAdapter(DepthCameraAdapter):
             joints = data["joints_mm"]
             confidence = data["joint_confidence"]
             timestamps = data["timestamp_usec"]
+            orientations = (
+                data["joint_orientations_wxyz"]
+                if "joint_orientations_wxyz" in data.files
+                else None
+            )
         if colors.ndim == 3:
             colors = colors[np.newaxis, ...]
         if depths.ndim == 2:
@@ -289,10 +324,39 @@ class ReplayCameraAdapter(DepthCameraAdapter):
                 joint_confidence=confidence[index],
                 calibration=calibration,
                 timestamp_usec=int(timestamps[index]),
+                joint_orientations_wxyz=(
+                    orientations[index] if orientations is not None else None
+                ),
                 metadata={"body_count": 1, "contour_coverage": 0.98},
             )
             for index in range(len(joints))
         ]
+
+    @staticmethod
+    def _verify_recorded_files(pose_root: Path, paths: tuple[Path, ...]) -> None:
+        manifest_path = pose_root / "manifest.json"
+        if not manifest_path.exists():
+            return
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise CameraError(f"回放 manifest 无法读取：{manifest_path}") from exc
+        files = manifest.get("files", {})
+        for path in paths:
+            if not path.exists():
+                continue
+            relative = path.relative_to(pose_root).as_posix()
+            expected = files.get(relative)
+            if not expected:
+                continue
+            if path.stat().st_size != int(expected.get("bytes", -1)):
+                raise CameraError(f"回放文件大小校验失败：{relative}")
+            digest = hashlib.sha256()
+            with path.open("rb") as stream:
+                for block in iter(lambda: stream.read(1024 * 1024), b""):
+                    digest.update(block)
+            if digest.hexdigest() != expected.get("sha256"):
+                raise CameraError(f"回放文件 SHA-256 校验失败：{relative}")
 
     def preview_frame(self, pose: PoseKind) -> FrameBundle:
         return self._load(pose)[0]
@@ -403,6 +467,7 @@ class AzureKinectAdapter(DepthCameraAdapter):
         native_joints = np.asarray(skeleton.joints)
         joints = np.zeros((32, 3), dtype=np.float64)
         confidence = np.zeros(32, dtype=np.uint8)
+        orientations = np.full((32, 4), np.nan, dtype=np.float64)
         for index in range(32):
             joint = native_joints[index]
             try:
@@ -415,6 +480,32 @@ class AzureKinectAdapter(DepthCameraAdapter):
                 -float(coordinates[1]),
                 float(coordinates[2]),
             )
+            try:
+                native_orientation = joint.orientation
+            except AttributeError:
+                try:
+                    native_orientation = joint["orientation"]
+                except (KeyError, TypeError):
+                    native_orientation = None
+            if native_orientation is not None:
+                values = getattr(native_orientation, "wxyz", native_orientation)
+                try:
+                    array = np.asarray(values, dtype=float).reshape(-1)
+                except (TypeError, ValueError):
+                    array = np.array(
+                        [
+                            getattr(native_orientation, "w"),
+                            getattr(native_orientation, "x"),
+                            getattr(native_orientation, "y"),
+                            getattr(native_orientation, "z"),
+                        ],
+                        dtype=float,
+                    )
+                if array.size == 4 and np.all(np.isfinite(array)):
+                    try:
+                        orientations[index] = reflect_camera_y_to_up(array)
+                    except ValueError:
+                        pass
             try:
                 confidence[index] = int(joint.confidence_level)
             except AttributeError:
@@ -450,6 +541,9 @@ class AzureKinectAdapter(DepthCameraAdapter):
                 "intrinsics": intrinsics,
             },
             timestamp_usec=int(time.time_ns() // 1000),
+            joint_orientations_wxyz=(
+                orientations if np.all(np.isfinite(orientations)) else None
+            ),
             metadata={"body_count": body_count},
         )
 
@@ -571,6 +665,7 @@ def _lightweight_preview(frame: FrameBundle, max_width: int = 320) -> FrameBundl
         joint_confidence=frame.joint_confidence,
         calibration=calibration,
         timestamp_usec=frame.timestamp_usec,
+        joint_orientations_wxyz=frame.joint_orientations_wxyz,
         metadata=frame.metadata,
     )
 
@@ -606,7 +701,21 @@ def _camera_process_main(
                     frames = adapter.capture_stable_window(
                         pose, float(command.get("duration", 2.0))
                     )
-                    quality = evaluate_quality(frames, pose)
+                    calibration_update = command.get("calibration_update", {})
+                    for frame in frames:
+                        frame.calibration.update(calibration_update)
+                    if command.get("quality_mode") == "pelvis":
+                        from posture_assessment.pelvis.quality import evaluate_pelvis_quality
+
+                        quality = evaluate_pelvis_quality(frames, pose)
+                    else:
+                        quality = evaluate_quality(frames, pose)
+                    quality_details_update = command.get("quality_details_update", {})
+                    if quality_details_update:
+                        quality = replace(
+                            quality,
+                            details={**quality.details, **quality_details_update},
+                        )
                     device = adapter.probe()
                     artifact_dir, manifest_sha, archived_path, analysis_frames = ArtifactStore(
                         Path(command["assessment_root"])
@@ -616,8 +725,9 @@ def _camera_process_main(
                         frames,
                         quality,
                         device,
-                        ALGORITHM_VERSION,
+                        str(command.get("algorithm_version") or ALGORITHM_VERSION),
                         int(command["attempt_no"]),
+                        namespace=command.get("namespace"),
                     )
                     result_queue.put(
                         {
@@ -703,6 +813,12 @@ class CameraProcessClient:
         assessment_root: Path,
         session_no: str,
         attempt_no: int,
+        *,
+        namespace: str | None = None,
+        algorithm_version: str | None = None,
+        calibration_update: dict[str, Any] | None = None,
+        quality_mode: str = "posture",
+        quality_details_update: dict[str, Any] | None = None,
     ) -> StoredCapturePayload:
         return self._request(
             {
@@ -712,6 +828,11 @@ class CameraProcessClient:
                 "assessment_root": str(assessment_root),
                 "session_no": session_no,
                 "attempt_no": attempt_no,
+                "namespace": namespace,
+                "algorithm_version": algorithm_version,
+                "calibration_update": calibration_update or {},
+                "quality_mode": quality_mode,
+                "quality_details_update": quality_details_update or {},
             },
             timeout=max(60.0, duration_seconds + 45.0),
         )

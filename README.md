@@ -1,6 +1,6 @@
 # 体态评估系统
 
-基于 Python 3.12、PySide6 和 SQLite 的 Windows 桌面应用。现已实现患者档案、五姿势 Azure Kinect 体态采集、硬质量门、体表点云代理指标、人工复核和本地结果持久化。
+基于 Python 3.12、PySide6 和 SQLite 的 Windows 桌面应用。现已实现患者档案、五姿势 Azure Kinect 体态采集、单机四方向骨盆体态筛查、硬质量门、体表点云代理指标、人工复核和本地结果持久化。
 
 ## 运行
 
@@ -44,6 +44,30 @@
 - 文献初始阈值位于 `data/posture_thresholds.json`，默认 `validated=false`，因此分级统一显示“实验性/待验证”。
 - 人工量尺/直线/水平线/垂线/角度、缩放、镜像、撤销/恢复标注单独写入 `posture_reviews`，不会覆盖自动测点。
 - `analysis_ready(session_id)` 已接入“查看报告”占位模块；本阶段不生成 PDF。
+
+## 骨盆体态筛查模块
+
+- 单台 Azure Kinect 按正面、左侧、背面、右侧依次采集；复用设备自检、地面标定、相机工作进程、质量门和重拍归档。
+- `FrameBundle` 与 NPZ 回放支持可选的 32 个关节 `wxyz` 四元数；旧回放缺少该字段时仍可使用，但不输出 SDK 模型姿态指标。
+- 真机采集前以骨盆、左髋、右髋的位置 RMS 和关节姿态离散度执行稳定预热，处理模式、设备序列号和质量详情写入审计数据。
+- 输出髋中心高低差、髋轴冠状倾斜代理角、骨盆中心相对支撑基底侧移、模型骨盆前后倾代理角、模型骨盆水平旋转代理角和背面髋臀区体表对称差代理值。
+- 正/背面与左/右侧指标做置信度加权融合；角度使用圆周平均。超过跨视图容差时保留原始视图值并转为“需人工复核”，不会强行平均。
+- 采集页仅显示 RGB、深度伪彩、骨架、髋部 ROI 和 SDK 模型代理点；结果页为二维叠加，不生成个体骨骼透视或三维骨盆重建。
+- 所有结果统一标记为“实验性/待验证”或“置信度不足”，不显示正常/轻度/中度等医学分级；SDK 模型骨盆角不等同于真实 ASIS–PSIS 临床骨盆角。
+- `analysis_ready(session_id)` 向报告模块提供结构化指标、四方向质量、算法版本和免责声明；首版不单独生成 PDF。
+
+骨盆采集数据与五姿势体态目录隔离：
+
+```text
+data/assessments/<session_no>/pelvis/
+├── front/
+├── left/
+├── back/
+├── right/
+└── _retake_history/
+```
+
+新增 SQLite 表：`pelvis_captures`、`pelvis_analysis_runs`、`pelvis_measurements`。现有数据库启动时通过 SQLAlchemy `create_all` 补建新表。
 
 体态原始数据结构：
 

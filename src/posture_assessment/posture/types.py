@@ -93,6 +93,7 @@ class FrameBundle:
     joint_confidence: np.ndarray
     calibration: dict[str, Any]
     timestamp_usec: int
+    joint_orientations_wxyz: np.ndarray | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -101,10 +102,19 @@ class FrameBundle:
         self.body_mask = np.asarray(self.body_mask, dtype=np.uint8)
         self.joints_mm = np.asarray(self.joints_mm, dtype=np.float64)
         self.joint_confidence = np.asarray(self.joint_confidence, dtype=np.uint8)
+        if self.joint_orientations_wxyz is not None:
+            self.joint_orientations_wxyz = np.asarray(
+                self.joint_orientations_wxyz, dtype=np.float64
+            )
         if self.joints_mm.shape != (32, 3):
             raise ValueError("joints_mm 必须为 (32, 3)")
         if self.joint_confidence.shape != (32,):
             raise ValueError("joint_confidence 必须为 (32,)")
+        if (
+            self.joint_orientations_wxyz is not None
+            and self.joint_orientations_wxyz.shape != (32, 4)
+        ):
+            raise ValueError("joint_orientations_wxyz 必须为 (32, 4)")
 
 
 @dataclass(frozen=True, slots=True)

@@ -79,11 +79,17 @@ class ArtifactStore:
         device: DeviceInfo,
         algorithm_version: str,
         attempt_no: int,
+        *,
+        namespace: str | None = None,
     ) -> tuple[Path, str, Path | None, list[FrameBundle]]:
         if not frames:
             raise ArtifactError("没有可保存的采集帧")
         self.ensure_capacity()
         session_root = self.assessment_root / session_no
+        if namespace:
+            if not namespace.replace("-", "").replace("_", "").isalnum():
+                raise ArtifactError("采集命名空间包含非法字符")
+            session_root = session_root / namespace
         session_root.mkdir(parents=True, exist_ok=True)
         final_dir = session_root / pose.value
         temp_dir = Path(tempfile.mkdtemp(prefix=f".{pose.value}-", dir=session_root))
@@ -92,6 +98,11 @@ class ArtifactStore:
             mask = np.stack([frame.body_mask for frame in frames])
             joints = np.stack([frame.joints_mm for frame in frames])
             confidence = np.stack([frame.joint_confidence for frame in frames])
+            orientations = (
+                np.stack([frame.joint_orientations_wxyz for frame in frames])
+                if all(frame.joint_orientations_wxyz is not None for frame in frames)
+                else None
+            )
             timestamps = np.array([frame.timestamp_usec for frame in frames], dtype=np.int64)
             median_depth = np.median(depth, axis=0).astype(np.uint16)
             median_mask = (np.mean(mask > 0, axis=0) >= 0.5).astype(np.uint8) * 255
@@ -131,6 +142,7 @@ class ArtifactStore:
                     joint_confidence=frame.joint_confidence,
                     calibration=analysis_calibration,
                     timestamp_usec=frame.timestamp_usec,
+                    joint_orientations_wxyz=frame.joint_orientations_wxyz,
                     metadata=frame.metadata,
                 )
                 for frame in frames
@@ -140,15 +152,17 @@ class ArtifactStore:
             # Azure frames are streamed one by one to avoid a second full RGB stack.
             if device.is_mock or device.backend == "replay":
                 color = np.stack([frame.color for frame in frames])
-                np.savez_compressed(
-                    temp_dir / "frames.npz",
-                    color=color,
-                    depth_mm=depth,
-                    body_mask=mask,
-                    joints_mm=joints,
-                    joint_confidence=confidence,
-                    timestamp_usec=timestamps,
-                )
+                payload = {
+                    "color": color,
+                    "depth_mm": depth,
+                    "body_mask": mask,
+                    "joints_mm": joints,
+                    "joint_confidence": confidence,
+                    "timestamp_usec": timestamps,
+                }
+                if orientations is not None:
+                    payload["joint_orientations_wxyz"] = orientations
+                np.savez_compressed(temp_dir / "frames.npz", **payload)
             else:
                 raw_dir = temp_dir / "raw_frames"
                 raw_dir.mkdir()
@@ -160,21 +174,24 @@ class ArtifactStore:
                         body_mask=frame.body_mask,
                         timestamp_usec=np.array(frame.timestamp_usec, dtype=np.int64),
                     )
-            np.savez_compressed(
-                temp_dir / "analysis_window.npz",
-                color=analysis_color,
-                depth_mm=analysis_depth,
-                body_mask=analysis_mask,
-                joints_mm=joints,
-                joint_confidence=confidence,
-                timestamp_usec=timestamps,
-            )
-            np.savez_compressed(
-                temp_dir / "joints.npz",
-                joints_mm=joints,
-                joint_confidence=confidence,
-                timestamp_usec=timestamps,
-            )
+            analysis_payload = {
+                "color": analysis_color,
+                "depth_mm": analysis_depth,
+                "body_mask": analysis_mask,
+                "joints_mm": joints,
+                "joint_confidence": confidence,
+                "timestamp_usec": timestamps,
+            }
+            joints_payload = {
+                "joints_mm": joints,
+                "joint_confidence": confidence,
+                "timestamp_usec": timestamps,
+            }
+            if orientations is not None:
+                analysis_payload["joint_orientations_wxyz"] = orientations
+                joints_payload["joint_orientations_wxyz"] = orientations
+            np.savez_compressed(temp_dir / "analysis_window.npz", **analysis_payload)
+            np.savez_compressed(temp_dir / "joints.npz", **joints_payload)
             native_mkv = frames[-1].metadata.get("native_mkv_path")
             native_mkv_path = Path(native_mkv) if native_mkv else None
             if native_mkv_path is not None and native_mkv_path.exists():
@@ -204,6 +221,7 @@ class ArtifactStore:
             manifest: dict[str, Any] = {
                 "schema_version": 1,
                 "session_no": session_no,
+                "namespace": namespace,
                 "pose": pose.value,
                 "attempt_no": attempt_no,
                 "created_at": datetime.now().isoformat(timespec="seconds"),

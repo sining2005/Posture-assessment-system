@@ -17,9 +17,11 @@ from posture_assessment.config import AppSettings
 from posture_assessment.dongle import DongleAdapter
 from posture_assessment.import_export import UserExportService, UserImportService
 from posture_assessment.models import AssessmentSession, User
+from posture_assessment.pelvis.service import PelvisService
 from posture_assessment.posture.service import PostureService
 from posture_assessment.services import UserService
 from posture_assessment.ui.dialogs import SettingsDialog
+from posture_assessment.ui.pelvis_page import PelvisPage
 from posture_assessment.ui.posture_page import PosturePage
 from posture_assessment.ui.theme import NAV, PINK, PINK_DARK
 from posture_assessment.ui.user_page import UserPage
@@ -69,12 +71,14 @@ class MainWindow(QMainWindow):
         operator_name: str,
         parent: QWidget | None = None,
         posture_service: PostureService | None = None,
+        pelvis_service: PelvisService | None = None,
     ):
         super().__init__(parent)
         self.settings = settings
         self.dongle = dongle
         self.operator_name = operator_name
         self.posture_service = posture_service or PostureService(user_service.db, settings)
+        self.pelvis_service = pelvis_service or PelvisService(user_service.db, settings)
         self.setWindowTitle("体态评估系统")
         self.setMinimumSize(1200, 760)
         self._build_ui(user_service, import_service, export_service)
@@ -145,18 +149,30 @@ class MainWindow(QMainWindow):
         self.posture_page.analysis_ready.connect(self._analysis_ready)
         self.page_indexes["体态检测"] = self.pages.addWidget(self.posture_page)
         for module in self.MODULES[2:]:
-            self.page_indexes[module] = self.pages.addWidget(PlaceholderPage(module))
+            if module == "骨盆检测":
+                self.pelvis_page = PelvisPage(self.pelvis_service, self.operator_name)
+                self.pelvis_page.analysis_ready.connect(self._pelvis_analysis_ready)
+                page = self.pelvis_page
+            else:
+                page = PlaceholderPage(module)
+            self.page_indexes[module] = self.pages.addWidget(page)
         root.addWidget(self.pages, 1)
         self.setCentralWidget(central)
         self.nav_buttons["用户信息"].setChecked(True)
         self.show_module("用户信息")
 
     def show_module(self, module: str) -> None:
+        # A single Azure Kinect cannot be owned by both worker processes at once.
+        if module == "骨盆检测":
+            self.posture_page.close_camera()
+        elif module == "体态检测" and hasattr(self, "pelvis_page"):
+            self.pelvis_page.close_camera()
         self.pages.setCurrentIndex(self.page_indexes[module])
         self.nav_buttons[module].setChecked(True)
 
     def _start_detection(self, user: User, assessment: AssessmentSession) -> None:
         self.posture_page.set_detection_context(user, assessment)
+        self.pelvis_page.set_detection_context(user, assessment)
         self.show_module("体态检测")
 
     def _analysis_ready(self, assessment_id: int) -> None:
@@ -165,6 +181,14 @@ class MainWindow(QMainWindow):
             page.context.setText(
                 f"体态 AnalysisResult 已就绪（session_id={assessment_id}）。\n"
                 "报告模块可通过 analysis_ready(session_id) 读取稳定数据包。"
+            )
+
+    def _pelvis_analysis_ready(self, assessment_id: int) -> None:
+        page = self.pages.widget(self.page_indexes["查看报告"])
+        if isinstance(page, PlaceholderPage):
+            page.context.setText(
+                f"骨盆 PelvisAnalysisResult 已就绪（session_id={assessment_id}）。\n"
+                "报告模块可读取结构化代理指标、质量门数据、算法版本和免责声明。"
             )
 
     def _open_settings(self) -> None:
@@ -177,4 +201,5 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event) -> None:
         self.posture_page.close_camera()
+        self.pelvis_page.close_camera()
         super().closeEvent(event)
