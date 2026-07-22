@@ -17,8 +17,10 @@ from posture_assessment.config import AppSettings
 from posture_assessment.dongle import DongleAdapter
 from posture_assessment.import_export import UserExportService, UserImportService
 from posture_assessment.models import AssessmentSession, User
+from posture_assessment.posture.service import PostureService
 from posture_assessment.services import UserService
 from posture_assessment.ui.dialogs import SettingsDialog
+from posture_assessment.ui.posture_page import PosturePage
 from posture_assessment.ui.theme import NAV, PINK, PINK_DARK
 from posture_assessment.ui.user_page import UserPage
 
@@ -66,11 +68,13 @@ class MainWindow(QMainWindow):
         dongle: DongleAdapter,
         operator_name: str,
         parent: QWidget | None = None,
+        posture_service: PostureService | None = None,
     ):
         super().__init__(parent)
         self.settings = settings
         self.dongle = dongle
         self.operator_name = operator_name
+        self.posture_service = posture_service or PostureService(user_service.db, settings)
         self.setWindowTitle("体态评估系统")
         self.setMinimumSize(1200, 760)
         self._build_ui(user_service, import_service, export_service)
@@ -137,7 +141,10 @@ class MainWindow(QMainWindow):
         )
         self.user_page.start_detection.connect(self._start_detection)
         self.page_indexes["用户信息"] = self.pages.addWidget(self.user_page)
-        for module in self.MODULES[1:]:
+        self.posture_page = PosturePage(self.posture_service, self.operator_name)
+        self.posture_page.analysis_ready.connect(self._analysis_ready)
+        self.page_indexes["体态检测"] = self.pages.addWidget(self.posture_page)
+        for module in self.MODULES[2:]:
             self.page_indexes[module] = self.pages.addWidget(PlaceholderPage(module))
         root.addWidget(self.pages, 1)
         self.setCentralWidget(central)
@@ -149,10 +156,25 @@ class MainWindow(QMainWindow):
         self.nav_buttons[module].setChecked(True)
 
     def _start_detection(self, user: User, assessment: AssessmentSession) -> None:
-        page = self.pages.widget(self.page_indexes["体态检测"])
-        if isinstance(page, PlaceholderPage):
-            page.set_detection_context(user, assessment)
+        self.posture_page.set_detection_context(user, assessment)
         self.show_module("体态检测")
 
+    def _analysis_ready(self, assessment_id: int) -> None:
+        page = self.pages.widget(self.page_indexes["查看报告"])
+        if isinstance(page, PlaceholderPage):
+            page.context.setText(
+                f"体态 AnalysisResult 已就绪（session_id={assessment_id}）。\n"
+                "报告模块可通过 analysis_ready(session_id) 读取稳定数据包。"
+            )
+
     def _open_settings(self) -> None:
-        SettingsDialog(self.settings, self.dongle, self).exec()
+        SettingsDialog(
+            self.settings,
+            self.dongle,
+            self,
+            posture_service=self.posture_service,
+        ).exec()
+
+    def closeEvent(self, event) -> None:
+        self.posture_page.close_camera()
+        super().closeEvent(event)

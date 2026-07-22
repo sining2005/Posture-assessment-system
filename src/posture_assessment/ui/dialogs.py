@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import date
+from typing import TYPE_CHECKING
 
 from PySide6.QtCore import QDate, Qt
 from PySide6.QtWidgets import (
@@ -17,6 +18,7 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QMessageBox,
     QPushButton,
+    QSpinBox,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
@@ -28,6 +30,9 @@ from posture_assessment.dongle import DongleAdapter
 from posture_assessment.models import User
 from posture_assessment.services import UserInput, UserService
 from posture_assessment.ui.theme import set_primary
+
+if TYPE_CHECKING:
+    from posture_assessment.posture.service import PostureService
 
 
 def show_error(parent: QWidget, title: str, message: str) -> None:
@@ -256,6 +261,7 @@ class SettingsDialog(QDialog):
         settings: AppSettings,
         dongle: DongleAdapter,
         parent: QWidget | None = None,
+        posture_service: "PostureService | None" = None,
     ):
         super().__init__(parent)
         self.setWindowTitle("系统设置")
@@ -265,17 +271,91 @@ class SettingsDialog(QDialog):
         form.addRow("数据目录", QLabel(str(settings.data_dir)))
         form.addRow("数据库", QLabel(str(settings.database_path)))
         form.addRow("导出目录", QLabel(str(settings.export_dir)))
+        form.addRow("体态原始数据", QLabel(str(settings.assessment_dir)))
+        form.addRow("相机后端", QLabel(settings.camera_backend))
+        form.addRow("阈值配置", QLabel(str(settings.posture_threshold_path)))
+        self.storage_status = QLabel("未统计")
+        form.addRow("原始数据占用", self.storage_status)
         self.dongle_status = QLabel()
         form.addRow("加密锁", self.dongle_status)
         root.addLayout(form)
         check = QPushButton("重新检测加密锁")
         check.clicked.connect(lambda: self._refresh_dongle(dongle))
         root.addWidget(check)
+        if posture_service is not None:
+            sessions, total = posture_service.storage_summary()
+            self.storage_status.setText(f"{sessions} 个会话，{self._format_bytes(total)}（默认不自动删除）")
+            cleanup_row = QHBoxLayout()
+            self.cleanup_days = QSpinBox()
+            self.cleanup_days.setRange(1, 3650)
+            self.cleanup_days.setValue(180)
+            self.cleanup_days.setSuffix(" 天")
+            cleanup_row.addWidget(QLabel("清理早于"))
+            cleanup_row.addWidget(self.cleanup_days)
+            cleanup_button = QPushButton("清理已完成/失败会话原始数据")
+            cleanup_button.clicked.connect(lambda: self._cleanup(posture_service))
+            cleanup_row.addWidget(cleanup_button)
+            root.addLayout(cleanup_row)
+            session_row = QHBoxLayout()
+            self.cleanup_session_no = QLineEdit()
+            self.cleanup_session_no.setPlaceholderText("AS2026…")
+            session_row.addWidget(QLabel("指定会话"))
+            session_row.addWidget(self.cleanup_session_no)
+            session_button = QPushButton("清理指定会话原始数据")
+            session_button.clicked.connect(
+                lambda: self._cleanup_session(posture_service)
+            )
+            session_row.addWidget(session_button)
+            root.addLayout(session_row)
         close = QPushButton("关闭")
         set_primary(close)
         close.clicked.connect(self.accept)
         root.addWidget(close, alignment=Qt.AlignmentFlag.AlignRight)
         self._refresh_dongle(dongle)
+
+    @staticmethod
+    def _format_bytes(value: int) -> str:
+        amount = float(value)
+        for unit in ("B", "KB", "MB", "GB", "TB"):
+            if amount < 1024 or unit == "TB":
+                return f"{amount:.1f} {unit}"
+            amount /= 1024
+        return f"{amount:.1f} TB"
+
+    def _cleanup(self, posture_service: "PostureService") -> None:
+        days = self.cleanup_days.value()
+        if not confirm(
+            self,
+            "确认清理原始数据？",
+            f"将永久删除 {days} 天以前、状态为已完成或失败的 RGB、Depth、MKV 和关节文件。\n"
+            "结构化指标与报告数据仍保留。此操作不可恢复。",
+        ):
+            return
+        count, freed = posture_service.cleanup_older_than(days)
+        sessions, total = posture_service.storage_summary()
+        self.storage_status.setText(f"{sessions} 个会话，{self._format_bytes(total)}（默认不自动删除）")
+        show_info(self, "清理完成", f"已清理 {count} 个会话，释放 {self._format_bytes(freed)}。")
+
+    def _cleanup_session(self, posture_service: "PostureService") -> None:
+        session_no = self.cleanup_session_no.text().strip()
+        if not session_no:
+            show_error(self, "缺少会话编号", "请输入要清理的检测会话编号。")
+            return
+        if not confirm(
+            self,
+            "确认清理指定会话？",
+            f"将永久删除会话 {session_no} 的 RGB、Depth、MKV 和关节原始文件。\n"
+            "结构化指标与报告数据仍保留。此操作不可恢复。",
+        ):
+            return
+        try:
+            freed = posture_service.cleanup_session_raw_data(session_no)
+        except Exception as exc:
+            show_error(self, "清理失败", str(exc))
+            return
+        sessions, total = posture_service.storage_summary()
+        self.storage_status.setText(f"{sessions} 个会话，{self._format_bytes(total)}（默认不自动删除）")
+        show_info(self, "清理完成", f"会话 {session_no} 已释放 {self._format_bytes(freed)}。")
 
     def _refresh_dongle(self, dongle: DongleAdapter) -> None:
         status = dongle.check()

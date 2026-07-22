@@ -11,6 +11,7 @@ from posture_assessment.config import AppSettings
 from posture_assessment.database import DatabaseManager
 from posture_assessment.dongle import MockDongleAdapter
 from posture_assessment.import_export import UserExportService, UserImportService
+from posture_assessment.posture.service import PostureService
 from posture_assessment.services import AuthService, UserService
 from posture_assessment.ui.login import LoginWindow
 from posture_assessment.ui.main_window import MainWindow
@@ -46,6 +47,7 @@ class ApplicationController(QObject):
             self.db, self.user_service, settings.import_log_dir
         )
         self.export_service = UserExportService(self.db, settings.export_dir)
+        self.posture_service = PostureService(self.db, settings)
         self.login_window: LoginWindow | None = None
         self.main_window: MainWindow | None = None
 
@@ -62,6 +64,7 @@ class ApplicationController(QObject):
             self.export_service,
             self.dongle,
             operator_name,
+            posture_service=self.posture_service,
         )
         self.main_window.showMaximized()
         if self.login_window:
