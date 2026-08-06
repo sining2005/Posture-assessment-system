@@ -13,3 +13,4 @@ tmp/
 
 # 原始 UI 设计稿仅作本地参考，不纳入版本库
 体态评估系统UI(4).pdf
+src/posture_assessment_desktop.egg-info/
