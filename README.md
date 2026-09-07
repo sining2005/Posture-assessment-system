@@ -115,13 +115,20 @@ $env:POSTURE_REPLAY_ROOT='D:\体态评估系统\data\assessments\AS...'
 
 项目不打包微软闭源 Body Tracking 二进制。部署机需单独完成 EULA/分发审查并安装：
 
-1. Azure Kinect Sensor SDK 1.4.x。
-2. Azure Kinect Body Tracking SDK 1.1.x。
+1. Azure Kinect Sensor SDK 1.4.x（提供 `k4a.dll`）。
+2. Azure Kinect Body Tracking SDK 1.1.x（提供 `k4abt.dll` 与 DNN 模型）。
 3. Python 硬件扩展：
 
 ```powershell
 & .\.venv\Scripts\python.exe -m pip install -e ".[hardware]"
 ```
+
+SDK 运行库支持两种放置方式，适配器会按顺序查找（项目内优先，系统目录兜底）：
+
+- 项目内：把 Sensor SDK 的 `k4a.dll` 放到 `tools\`，把 Body Tracking 的 `sdk\windows-desktop\amd64\release\bin\` 整个目录放到项目 `sdk\` 下（含 `k4abt.dll`、`directml.dll`、`onnxruntime*.dll` 和 `dnn_model_*.onnx`）。
+- 系统默认安装：`C:\Program Files\Azure Kinect SDK v1.4.1` 与 `C:\Program Files\Azure Kinect Body Tracking SDK`。
+
+注意：k4abt 使用 ANSI 加载 ONNX 模型，项目位于中文目录时模型会自动复制到 `%LOCALAPPDATA%\posture-assessment\azure-kinect\`（ASCII 路径）后加载；首次打开设备会多花几秒完成复制。
 
 Body Tracking 优先 DirectML，初始化失败时自动降级 CPU 并在设备状态中提示。首次使用、设备序列号变化或重新自检时建立 IMU 重力/地面点云 RANSAC 标定档案。Azure Kinect SDK 已停止维护，因此业务代码只依赖通用相机接口，后续可增加 Orbbec Femto K4A 兼容实现。
 

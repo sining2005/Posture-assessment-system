@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ctypes
 import importlib
 import hashlib
 import json
@@ -253,6 +254,11 @@ class MockCameraAdapter(DepthCameraAdapter):
         sample_count = max(8, int(duration_seconds * 15))
         return [self._frame(pose, index) for index in range(sample_count)]
 
+    def calibration_frames(self, count: int = 6) -> list[FrameBundle]:
+        if not self._open:
+            self.open()
+        return [self._frame(PoseKind.FRONT, index) for index in range(count)]
+
     def close(self) -> None:
         self._open = False
 
@@ -367,26 +373,60 @@ class ReplayCameraAdapter(DepthCameraAdapter):
         del duration_seconds
         return self._load(pose)
 
+    def calibration_frames(self, count: int = 6) -> list[FrameBundle]:
+        return self._load(PoseKind.FRONT)[:count]
+
     def close(self) -> None:
         self._open = False
 
 
 class AzureKinectAdapter(DepthCameraAdapter):
-    """Late-bound adapter; Microsoft SDK/runtime binaries are never bundled."""
+    """Late-bound adapter; Microsoft SDK/runtime binaries are never bundled.
+
+    SDK 优先在项目内 ``sdk/`` 与 ``tools/`` 目录查找，其次才是系统默认安装目录。
+    """
 
     def __init__(self):
         self._pykinect: Any = None
         self._device: Any = None
         self._tracker: Any = None
         self._tracking_mode = "DirectML"
+        self._dll_search_handles: list[Any] = []
 
     @staticmethod
-    def _runtime_candidates() -> tuple[Path, ...]:
+    def _project_root() -> Path:
+        return Path(__file__).resolve().parents[3]
+
+    @classmethod
+    def _runtime_candidates(cls) -> tuple[Path, ...]:
         program_files = Path(os.environ.get("ProgramFiles", r"C:\Program Files"))
         return (
+            *cls._local_sdk_candidates(),
             program_files / "Azure Kinect SDK v1.4.1" / "sdk" / "windows-desktop" / "amd64" / "release" / "bin" / "k4a.dll",
             program_files / "Azure Kinect Body Tracking SDK" / "tools" / "k4abt.dll",
         )
+
+    @classmethod
+    def _local_sdk_candidates(cls) -> tuple[Path, ...]:
+        root = cls._project_root()
+        sdk_bin = root / "sdk" / "windows-desktop" / "amd64" / "release" / "bin"
+        tools = root / "tools"
+        return (
+            sdk_bin / "k4a.dll",
+            tools / "k4a.dll",
+            sdk_bin / "k4abt.dll",
+            tools / "k4abt.dll",
+        )
+
+    @classmethod
+    def _sdk_dll_paths(cls) -> tuple[Path, Path] | None:
+        k4a_candidates = tuple(p for p in cls._runtime_candidates() if p.name == "k4a.dll")
+        k4abt_candidates = tuple(p for p in cls._runtime_candidates() if p.name == "k4abt.dll")
+        k4a = next((p for p in k4a_candidates if p.exists()), None)
+        k4abt = next((p for p in k4abt_candidates if p.exists()), None)
+        if k4a is None or k4abt is None:
+            return None
+        return k4a, k4abt
 
     def probe(self) -> DeviceInfo:
         try:
@@ -401,20 +441,30 @@ class AzureKinectAdapter(DepthCameraAdapter):
                 message=f"Python 绑定不可用：{exc}",
                 requires_calibration=True,
             )
-        if not all(path.exists() for path in self._runtime_candidates()):
+        if self._sdk_dll_paths() is None:
+            local_hits = [p.name for p in self._local_sdk_candidates() if p.exists()]
             return DeviceInfo(
                 available=False,
                 backend="azure_kinect",
                 serial_number="",
                 model="Azure Kinect DK",
                 tracking_mode="DirectML → CPU",
-                message="未检测到 Azure Kinect Sensor/Body Tracking 运行库",
+                message=(
+                    "未检测到 Azure Kinect Sensor/Body Tracking 运行库"
+                    + (f"（项目内已找到：{', '.join(local_hits)}）" if local_hits else "")
+                ),
                 requires_calibration=True,
             )
+        serial = "待设备打开后读取"
+        if self._device is not None:
+            try:
+                serial = self._device.get_serialnum()
+            except Exception:
+                pass
         return DeviceInfo(
             available=True,
             backend="azure_kinect",
-            serial_number="待设备打开后读取",
+            serial_number=serial,
             model="Azure Kinect DK",
             tracking_mode="DirectML → CPU",
             message="SDK 已发现，等待打开设备",
@@ -425,22 +475,38 @@ class AzureKinectAdapter(DepthCameraAdapter):
         probe = self.probe()
         if not probe.available:
             raise CameraError(probe.message)
+        sdk_paths = self._sdk_dll_paths()
+        assert sdk_paths is not None
+        k4a_path, k4abt_path = sdk_paths
+        for directory in {k4a_path.parent, k4abt_path.parent}:
+            self._dll_search_handles.append(os.add_dll_directory(str(directory)))
         self._pykinect = importlib.import_module("pykinect_azure")
-        self._pykinect.initialize_libraries(track_body=True)
+        self._pykinect.initialize_libraries(
+            module_k4a_path=str(k4a_path),
+            module_k4abt_path=str(k4abt_path),
+            track_body=True,
+        )
         self._device = self._pykinect.start_device()
+        model_path = self._native_model_path(k4abt_path)
         try:
-            config = self._pykinect.default_tracker_configuration
+            config = self._pykinect.k4abt_tracker_default_configuration
             mode = getattr(self._pykinect, "K4ABT_TRACKER_PROCESSING_MODE_GPU_DIRECTML")
             config.processing_mode = mode
+            config.model_path = model_path
             self._tracker = self._pykinect.start_body_tracker(config)
         except Exception:
             self._tracking_mode = "CPU（DirectML 不可用）"
-            config = self._pykinect.default_tracker_configuration
+            config = self._pykinect.k4abt_tracker_default_configuration
             cpu_mode = getattr(self._pykinect, "K4ABT_TRACKER_PROCESSING_MODE_CPU", None)
             if cpu_mode is not None:
                 config.processing_mode = cpu_mode
+            config.model_path = model_path
             self._tracker = self._pykinect.start_body_tracker(config)
         serial = str(getattr(self._device, "serial_number", "AZURE-KINECT"))
+        try:
+            serial = self._device.get_serialnum()
+        except Exception:
+            pass
         return DeviceInfo(
             available=True,
             backend="azure_kinect",
@@ -450,6 +516,31 @@ class AzureKinectAdapter(DepthCameraAdapter):
             message="相机与 Body Tracking 已连接",
             requires_calibration=True,
         )
+
+    @staticmethod
+    def _native_model_path(k4abt_path: Path) -> bytes:
+        """Return an ASCII path to the default ONNX model for the native SDK.
+
+        k4abt 使用 ANSI 加载模型文件，项目位于中文目录时原生库无法读取；
+        将模型复制到本地应用数据（ASCII 路径）后返回该路径。
+        """
+        source = k4abt_path.parent / "dnn_model_2_0_op11.onnx"
+        if not source.exists():
+            return b""
+        try:
+            cache_dir = Path(os.environ["LOCALAPPDATA"]) / "posture-assessment" / "azure-kinect"
+        except KeyError:
+            return b""
+        cache_model = cache_dir / "dnn_model_2_0_op11.onnx"
+        if not cache_model.exists():
+            try:
+                cache_dir.mkdir(parents=True, exist_ok=True)
+                with source.open("rb") as src, cache_model.open("wb") as dst:
+                    while block := src.read(1024 * 1024):
+                        dst.write(block)
+            except OSError:
+                return b""
+        return str(cache_model).encode("utf-8")
 
     def _read_native(self) -> FrameBundle:
         if self._device is None or self._tracker is None:
@@ -464,53 +555,60 @@ class AzureKinectAdapter(DepthCameraAdapter):
         if not color_ok or not depth_ok:
             raise CameraError("RGB 或 Depth 帧无效")
         skeleton = body_frame.get_body_skeleton(0)
-        native_joints = np.asarray(skeleton.joints)
+        native_joints = skeleton.joints
         joints = np.zeros((32, 3), dtype=np.float64)
         confidence = np.zeros(32, dtype=np.uint8)
         orientations = np.full((32, 4), np.nan, dtype=np.float64)
         for index in range(32):
             joint = native_joints[index]
-            try:
-                position = joint.position
-            except AttributeError:
+            position = getattr(joint, "position", None)
+            if position is None and isinstance(joint, dict):
                 position = joint["position"]
             coordinates = getattr(position, "xyz", position)
-            joints[index] = (
-                float(coordinates[0]),
-                -float(coordinates[1]),
-                float(coordinates[2]),
-            )
             try:
-                native_orientation = joint.orientation
+                x = float(coordinates.x)
+                y = float(coordinates.y)
+                z = float(coordinates.z)
             except AttributeError:
                 try:
-                    native_orientation = joint["orientation"]
-                except (KeyError, TypeError):
-                    native_orientation = None
+                    vector = getattr(position, "v", coordinates)
+                    x = float(vector[0])
+                    y = float(vector[1])
+                    z = float(vector[2])
+                except (TypeError, ValueError, IndexError):
+                    continue
+            joints[index] = (x, -y, z)
+            native_orientation = getattr(joint, "orientation", None)
+            if native_orientation is None and isinstance(joint, dict):
+                native_orientation = joint.get("orientation")
             if native_orientation is not None:
-                values = getattr(native_orientation, "wxyz", native_orientation)
+                quaternion = getattr(native_orientation, "wxyz", native_orientation)
                 try:
-                    array = np.asarray(values, dtype=float).reshape(-1)
-                except (TypeError, ValueError):
-                    array = np.array(
-                        [
-                            getattr(native_orientation, "w"),
-                            getattr(native_orientation, "x"),
-                            getattr(native_orientation, "y"),
-                            getattr(native_orientation, "z"),
-                        ],
-                        dtype=float,
-                    )
-                if array.size == 4 and np.all(np.isfinite(array)):
+                    w = float(quaternion.w)
+                    qx = float(quaternion.x)
+                    qy = float(quaternion.y)
+                    qz = float(quaternion.z)
+                except AttributeError:
+                    try:
+                        vector = getattr(native_orientation, "v", quaternion)
+                        w, qx, qy, qz = (float(value) for value in vector)
+                    except (TypeError, ValueError, IndexError):
+                        continue
+                array = np.array([w, qx, qy, qz], dtype=float)
+                if np.all(np.isfinite(array)):
                     try:
                         orientations[index] = reflect_camera_y_to_up(array)
                     except ValueError:
                         pass
-            try:
-                confidence[index] = int(joint.confidence_level)
-            except AttributeError:
-                confidence[index] = int(joint["confidence_level"])
-        mask_ok, mask = body_frame.get_body_index_map()
+            confidence_level = getattr(joint, "confidence_level", None)
+            if confidence_level is None and isinstance(joint, dict):
+                confidence_level = joint.get("confidence_level")
+            if confidence_level is not None:
+                try:
+                    confidence[index] = int(confidence_level)
+                except (TypeError, ValueError):
+                    pass
+        mask_ok, mask = body_frame.get_body_index_map_image()
         if not mask_ok:
             mask = np.where(np.asarray(depth) > 0, 1, 0).astype(np.uint8)
         else:
@@ -518,8 +616,11 @@ class AzureKinectAdapter(DepthCameraAdapter):
         intrinsics: dict[str, float] = {}
         try:
             native_calibration = self._device.calibration
-            camera_calibration = native_calibration.depth_camera_calibration
-            parameters = camera_calibration.intrinsics.parameters.param
+            parameters = (
+                native_calibration.depth_params
+                if hasattr(native_calibration, "depth_params")
+                else native_calibration.depth_camera_calibration.intrinsics.parameters.param
+            )
             intrinsics = {
                 "fx": float(parameters.fx),
                 "fy": float(parameters.fy),
@@ -550,6 +651,70 @@ class AzureKinectAdapter(DepthCameraAdapter):
     def preview_frame(self, pose: PoseKind) -> FrameBundle:
         del pose
         return self._read_native()
+
+    def calibration_frames(self, count: int = 6) -> list[FrameBundle]:
+        """Depth-only frames with IMU gravity for ground calibration.
+
+        Calibration does not need a tracked person; the floor is extracted from
+        the lower part of the depth image, so the site check works standalone.
+        """
+        if self._device is None:
+            self.open()
+        gravity = (0.0, -1.0, 0.0)
+        try:
+            imu = self._device.update_imu()
+            acceleration = np.asarray(imu.get_acc(), dtype=float).reshape(-1)
+            if acceleration.size == 3 and np.all(np.isfinite(acceleration)):
+                gravity = tuple(float(value) for value in acceleration)
+        except Exception:
+            pass
+        frames: list[FrameBundle] = []
+        while len(frames) < count:
+            capture = self._device.update()
+            color_ok, color = capture.get_color_image()
+            depth_ok, depth = capture.get_depth_image()
+            if not color_ok or not depth_ok:
+                raise CameraError("RGB 或 Depth 帧无效")
+            intrinsics: dict[str, float] = {}
+            try:
+                native_calibration = self._device.calibration
+                parameters = (
+                    native_calibration.depth_params
+                    if hasattr(native_calibration, "depth_params")
+                    else native_calibration.depth_camera_calibration.intrinsics.parameters.param
+                )
+                intrinsics = {
+                    "fx": float(parameters.fx),
+                    "fy": float(parameters.fy),
+                    "cx": float(parameters.cx),
+                    "cy": float(parameters.cy),
+                }
+            except (AttributeError, TypeError, ValueError):
+                pass
+            depth_array = np.asarray(depth)
+            frames.append(
+                FrameBundle(
+                    color=np.asarray(color)[..., :3],
+                    depth_mm=depth_array,
+                    body_mask=np.zeros(depth_array.shape, dtype=np.uint8),
+                    joints_mm=np.zeros((32, 3), dtype=np.float64),
+                    joint_confidence=np.zeros(32, dtype=np.uint8),
+                    calibration={
+                        "coordinate_system": "camera_mm_right_up_forward",
+                        "device_serial": str(
+                            getattr(self._device, "serial_number", "AZURE-KINECT")
+                        ),
+                        "intrinsics": intrinsics,
+                    },
+                    timestamp_usec=int(time.time_ns() // 1000),
+                    joint_orientations_wxyz=None,
+                    metadata={
+                        "body_count": 0,
+                        "gravity_vector": gravity,
+                    },
+                )
+            )
+        return frames
 
     def capture_stable_window(
         self, pose: PoseKind, duration_seconds: float = 2.0
@@ -618,6 +783,13 @@ class AutoCameraAdapter(DepthCameraAdapter):
 
     def preview_frame(self, pose: PoseKind) -> FrameBundle:
         return self._require_active().preview_frame(pose)
+
+    def calibration_frames(self, count: int = 6) -> list[FrameBundle]:
+        active = self._require_active()
+        method = getattr(active, "calibration_frames", None)
+        if method is not None:
+            return method(count)
+        return [active.preview_frame(PoseKind.FRONT) for _ in range(count)]
 
     def capture_stable_window(
         self, pose: PoseKind, duration_seconds: float = 2.0
@@ -746,7 +918,7 @@ def _camera_process_main(
                     from dataclasses import asdict as profile_asdict
                     from posture_assessment.posture.calibration import CalibrationManager
 
-                    frames = [adapter.preview_frame(PoseKind.FRONT) for _ in range(6)]
+                    frames = adapter.calibration_frames(6)
                     profile = CalibrationManager(Path(command["calibration_root"])).calibrate(
                         adapter.probe(), frames
                     )

@@ -13,7 +13,9 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 
 @pytest.fixture
-def settings(tmp_path: Path) -> AppSettings:
+def settings(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> AppSettings:
+    # 服务测试必须使用确定性模拟相机，避免真机插入后 auto 后端接管
+    monkeypatch.setenv("POSTURE_CAMERA_BACKEND", "mock")
     return AppSettings.load(tmp_path / "app-data")
 
 

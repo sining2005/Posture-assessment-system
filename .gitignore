@@ -11,5 +11,11 @@ tmp/
 .test-tmp/
 .test-cache/
 
+# 微软闭源 Azure Kinect 运行库与 CUDA/DirectML 二进制不入库，
+# 部署机按 README「Azure Kinect 真机准备」自行放置
+sdk/
+tools/
+*.egg-info/
+
 # 原始 UI 设计稿仅作本地参考，不纳入版本库
 体态评估系统UI(4).pdf
